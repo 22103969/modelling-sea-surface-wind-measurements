@@ -1,0 +1,559 @@
+---
+  title: "Code for Modelling Metocean Conditions on Australia's North West Shelf"
+  header-includes:
+   - \usepackage{bm}
+   - \newcommand{\vect}[1]{\boldsymbol{#1}}
+  output: 
+    bookdown::html_document2:
+      keep_tex: true
+      number_sections: true
+---
+
+Clean workspace and import libraries
+```{r, results='hide',message=FALSE, warning=FALSE,error=FALSE}
+  #setwd("~/Dropbox/Honours Max/")
+  rm(list = ls())
+  
+  library(BVAR)
+  library(ggplot2)
+  library(gridExtra)
+  library(invgamma)
+  library(MASS)
+  library(dplyr)
+  library(MCMCpack)
+  library(matrixcalc)
+  library(LaplacesDemon)
+  library(coda)
+  library(plyr)
+  library(Metrics)
+  library(astsa)
+  library(fGarch)
+  library(forecast)
+  library(bayesplot)
+  library(stochvol)
+  library(scoringutils)
+  library(vars)
+
+  theme_set(theme_bw())
+  
+  theme_update(text=element_text(family="Times New Roman"))
+```
+
+```{r}
+  forecast_horizon <- 0
+
+  wind_fore <- readRDS("data/wind_fore.RDS") %>%
+    as_tibble()
+
+  wind_meas <- readRDS("data/wind_meas.RDS") %>%
+    as_tibble()
+  
+  #remove duplicate wind measurements
+  wind_meas <- dplyr::distinct(wind_meas)
+
+  #two duplicates remain with different measurements, leave only first value
+  wind_meas <- wind_meas[-(which(duplicated(wind_meas$time))),]
+
+  
+  #create an hourly array of times from 2017-07-17 13:00:00 to 2019-06-22 07:00:00
+  tt_start <- as.POSIXct("2017-07-17 13:00:00", tz="Australia/Perth")
+  tts <- seq(tt_start, by = "hours", length = 24*2*365-24*25-5)
+  full_time <- data.frame(time = tts)
+
+  #perform left join with measurements, so that times without measurements are still included
+  wind_meas_complete <- full_time %>%
+    dplyr::left_join(wind_meas %>%
+        dplyr::select(time = time, 
+                      easting_meas = ew_meas,
+                      northing_meas = nw_meas), 
+        by = 'time')
+  
+  #convert forecasts to a single time series by taking the smallest horizon for each time predicted
+  wind_fore$horizon <- as.numeric(wind_fore$time_predict-wind_fore$time_issued)/60/60
+  wind_fore <- wind_fore %>% subset(wind_fore$horizon >= forecast_horizon)
+  #how many missing 0 hour forecasts:
+  #length(wind_fore[which(is.na(wind_fore$ew_fore) & wind_fore$horizon == 0),]$horizon)
+  
+  wind_fore_na_omit <- na.omit(wind_fore)
+  wind_fore_single <- wind_fore_na_omit %>% group_by(time_predict) %>% top_n(-1, horizon)
+  
+  wind_fore_nowcasts <- wind_fore %>% dplyr::filter(wind_fore$horizon == forecast_horizon) 
+  missing_fore_indexes <- which(is.na(wind_fore_nowcasts$ew_fore))
+  
+  for (i in 1:length(missing_fore_indexes)){
+    replacement_index <- which(wind_fore_single$time_predict == wind_fore_nowcasts[missing_fore_indexes[i],]$time_predict)
+    wind_fore_nowcasts[missing_fore_indexes[i],]<- wind_fore_single[replacement_index,]
+  }
+  
+  wind_comb <- wind_meas_complete %>%
+    dplyr::inner_join(wind_fore_nowcasts %>%
+        dplyr::select(time_issued,
+           time = time_predict,
+           easting_fore = ew_fore,
+           northing_fore = nw_fore,
+           horizon = horizon), 
+      by = 'time')
+  
+  #all those missing easting meas also miss northing meas
+  missing_meas_indexes <- which(is.na(wind_comb$northing_meas))
+  missing_meas_forecasts <- cbind(1,wind_comb$northing_fore[missing_meas_indexes], wind_comb$easting_fore[missing_meas_indexes])
+  
+  Y <- data.matrix(wind_comb %>% dplyr::select(northing_meas, easting_meas))
+  X <- data.matrix(cbind(1,wind_comb %>% dplyr::select(northing_fore, easting_fore)))
+  N <- length(Y[,1])
+  
+  missing_length <- length(missing_meas_indexes)
+  identity_missing_length <- diag(missing_length)
+  predict_length <- 0
+```
+
+```{r, include=FALSE, results='hide',message=FALSE, warning=FALSE,error=FALSE}
+library(rstan)
+library(stats)
+
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+knitr::opts_chunk$set(echo = TRUE, tidy=TRUE)
+```
+
+Rose Plots and angular histograms:
+
+```{r}
+
+wind_comb_directional <- na.omit(wind_comb)
+wind_comb_directional$magnitude_meas <- sqrt(wind_comb_directional$easting_meas^2+wind_comb_directional$northing_meas^2)
+wind_comb_directional$magnitude_fore <- sqrt(wind_comb_directional$easting_fore^2+wind_comb_directional$northing_fore^2)
+
+get_bearing <- function(input){
+  northing <- input[1]; easting <- input[2];
+  y <- 90-atan2(northing,easting)*180/pi
+  if (y < 0) {y <- y + 360}
+  y
+}
+wind_comb_directional$direction_meas <- apply(cbind(wind_comb_directional$northing_meas, wind_comb_directional$easting_meas), 1,get_bearing)
+wind_comb_directional$direction_fore <- apply(cbind(wind_comb_directional$northing_fore, wind_comb_directional$easting_fore), 1,get_bearing)
+
+#hist(wind_comb_directional$direction)
+
+#wind_magnitudes 6 x 3
+wind_mags <- ggplot(wind_comb_directional, aes(x = wind_comb_directional$magnitude_meas)) + 
+    geom_histogram(aes(y =..density..),
+                   bins = 30,
+                   colour = "black", 
+                   fill = "white") +
+  theme(
+    axis.text.y = element_blank(),
+    axis.ticks.y = element_blank(),
+  )+
+  ylab("Frequency") + xlab("Magnitude (metres/second)")
+
+#wind_directions 3.5 x 3.5
+wind_direcs <- ggplot(wind_comb_directional, aes(x=direction_meas)) +
+  geom_histogram(color="black", fill="white", boundary = 0, binwidth = 22.5) +
+  scale_x_continuous("Direction (degrees from north)", position = "bottom", breaks = c(0, 90, 180, 270), labels = c(0, 90, 180, 270)) +
+  scale_y_continuous() +
+  coord_polar() +
+  theme(
+    axis.text.y = element_blank(),
+    axis.title.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.border = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+#wind_mags_direcs.pdf 9 x 4.5
+grid.arrange(wind_mags, wind_direcs, ncol=2, heights = unit(0.86,"npc"))
+
+mag_forevsmeas <- ggplot(wind_comb_directional %>% dplyr::filter(time < "2017-12-17 08:00:00")) + 
+    geom_line(aes(x = time, y = magnitude_meas, color = "Measured")) + 
+    geom_line(aes(x = time, y = magnitude_fore, color = "Forecast")) +
+    theme(legend.position = "none", text=element_text(family="Times New Roman")) +
+    ylab("Magnitude") + xlab("Month (2017)") +
+    scale_color_manual(name = "", values = c("Measured" = "blue", "Forecast" = "black"))
+
+direc_forevsmeas <- ggplot(wind_comb_directional %>% dplyr::filter(time < "2017-12-17 08:00:00")) + 
+    geom_line(aes(x = time, y = direction_meas, color = "Measured")) + 
+    geom_line(aes(x = time, y = direction_fore, color = "Forecast")) +
+    theme(legend.position = "bottom", text=element_text(family="Times New Roman")) +
+    ylab("Direction") + xlab("Month (2017)") +
+    scale_color_manual(name = "", values = c("Measured" = "blue", "Forecast" = "black"))
+
+grid.arrange(mag_forevsmeas, direc_forevsmeas, ncol=1)
+
+```
+
+### ------------------------------ FREQUENTIST, MODEL 1 & 2 -----------------------------------------
+
+```{r, results='hide', message=FALSE}
+
+ii_obs <- which(!is.na(Y[,1]))
+ii_mis <- which(is.na(Y[,1]))
+N_obs <- length(ii_obs)
+N_mis <- length(ii_mis)
+meas_obs <- t(na.omit(Y))
+fore <- t(X)
+
+fit_linear <- lm(Y ~ X[,2:3])
+
+```
+
+```{r}
+#acf_pacf_norm1, 1200 x 300
+northing_resid_acf1 <- ggAcf(fit_linear$residuals[,1]) + ggtitle("") + ylab("ACF of Northing Residuals") + ylim(-.075,0.26)
+northing_resid_pacf1 <- ggPacf(fit_linear$residuals[,1]) + ggtitle("") + ylab("PACF of Northing Residuals") + ylim(-.075,0.26)
+easting_resid_acf1 <- ggAcf(fit_linear$residuals[,2]) + ggtitle("") + ylab("ACF of Easting Residuals") + ylim(-.075,0.26)
+easting_resid_pacf1 <- ggPacf(fit_linear$residuals[,2]) + ggtitle("") + ylab("PACF of Easting Residuals")+ ylim(-.075,0.26)
+grid.arrange(northing_resid_acf1, northing_resid_pacf1, easting_resid_acf1, easting_resid_pacf1, ncol=4)
+
+#acf_pacf_norm1_squared, 1200 x 300
+northing_resid_sqd_acf1 <- ggAcf(fit_linear$residuals[,1]^2) + ggtitle("")  + ylab("ACF of Squared Northing Residuals") + ylim(-.075,0.4)
+northing_resid_sqd_pacf1 <- ggPacf(fit_linear$residuals[,1]^2) + ggtitle("") + ylab("PACF of Squared Northing Residuals")+ ylim(-.075,0.4)
+easting_resid_sqd_acf1 <- ggAcf(fit_linear$residuals[,2]^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") + ylim(-.075,0.4)
+easting_resid_sqd_pacf1 <- ggPacf(fit_linear$residuals[,2]^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") + ylim(-.075,0.4)
+grid.arrange(northing_resid_sqd_acf1, northing_resid_sqd_pacf1, easting_resid_sqd_acf1, easting_resid_sqd_pacf1, ncol=4)
+```
+
+
+```{r}
+
+nresid <- length(fit_linear$residuals[,1])
+covariates <- fit_linear$residuals[1:(nresid-4),]
+response <- fit_linear$residuals[5:nresid,]
+
+fit_autoregression <- lm(response ~ covariates)
+summary(fit_autoregression)
+
+northing_resid_acf1 <- ggAcf(fit_autoregression$residuals[,1]) + ggtitle("") + ylab("ACF of Northing Residuals") #+ ylim(-.075,0.26)
+northing_resid_pacf1 <- ggPacf(fit_autoregression$residuals[,1]) + ggtitle("") + ylab("PACF of Northing Residuals") #+ ylim(-.075,0.26)
+easting_resid_acf1 <- ggAcf(fit_autoregression$residuals[,2]) + ggtitle("") + ylab("ACF of Easting Residuals") #+ ylim(-.075,0.26)
+easting_resid_pacf1 <- ggPacf(fit_autoregression$residuals[,2]) + ggtitle("") + ylab("PACF of Easting Residuals") #+ ylim(-.075,0.26)
+grid.arrange(northing_resid_acf1, northing_resid_pacf1, easting_resid_acf1, easting_resid_pacf1, ncol=4)
+
+#acf_pacf_norm1_squared, 1200 x 300
+northing_resid_sqd_acf1 <- ggAcf(fit_linear$autoregression[,1]^2) + ggtitle("")  + ylab("ACF of Squared Northing Residuals") #+ ylim(-.075,0.4)
+northing_resid_sqd_pacf1 <- ggPacf(fit_linear$autoregression[,1]^2) + ggtitle("") + ylab("PACF of Squared Northing Residuals") #+ ylim(-.075,0.4)
+easting_resid_sqd_acf1 <- ggAcf(fit_linear$autoregression[,2]^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") #+ ylim(-.075,0.4)
+easting_resid_sqd_pacf1 <- ggPacf(fit_linear$autoregression[,2]^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") #+ ylim(-.075,0.4)
+grid.arrange(northing_resid_sqd_acf1, northing_resid_sqd_pacf1, easting_resid_sqd_acf1, easting_resid_sqd_pacf1, ncol=4)
+```
+
+
+```{r}
+#acf_pacf_norm2, 1200 x 300
+northing_resid_acf2 <- ggAcf(autoreg_resid$northing_meas) + ggtitle("") + ylab("ACF of Northing Residuals") + ylim(-.075,0.26)
+northing_resid_pacf2 <- ggPacf(autoreg_resid$northing_meas) + ggtitle("") + ylab("PACF of Northing Residuals") + ylim(-.075,0.26)
+easting_resid_acf2 <- ggAcf(autoreg_resid$easting_meas) + ggtitle("") + ylab("ACF of Easting Residuals") + ylim(-.075,0.26)
+easting_resid_pacf2 <- ggPacf(autoreg_resid$easting_meas) + ggtitle("") + ylab("PACF of Easting Residuals")+ ylim(-.075,0.26)
+grid.arrange(northing_resid_acf2, northing_resid_pacf2, easting_resid_acf2, easting_resid_pacf2, ncol=4)
+
+#acf_pacf_norm2_squared, 1200 x 300
+northing_resid_sqd_acf2 <- ggAcf(autoreg_resid$northing_meas^2) + ggtitle("")  + ylab("ACF of Squared Northing Residuals") + ylim(-.075,0.4)
+northing_resid_sqd_pacf2 <- ggPacf(autoreg_resid$northing_meas^2) + ggtitle("") + ylab("PACF of Squared Northing Residuals")+ ylim(-.075,0.4)
+easting_resid_sqd_acf2 <- ggAcf(autoreg_resid$easting_meas^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") + ylim(-.075,0.4)
+easting_resid_sqd_pacf2 <- ggPacf(autoreg_resid$easting_meas^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") + ylim(-.075,0.4)
+grid.arrange(northing_resid_sqd_acf2, northing_resid_sqd_pacf2, easting_resid_sqd_acf2, easting_resid_sqd_pacf2, ncol=4)
+```
+
+```{r}
+#qqplot_northing, 600 x 300
+qqplot_northing <- ggplot(autoreg_resid, aes(sample = northing_meas)) + stat_qq() + geom_abline(slope=1, intercept=0, col="red", alpha=0.6)+ xlab("Theoretical Quantiles") + ylab("Sample Quantiles (Northing Residuals)") + theme(aspect.ratio=1)
+
+#qqplot_easting, 600 x 300
+qqplot_easting <- ggplot(autoreg_resid, aes(sample = easting_meas)) + stat_qq() + geom_abline(slope=1, intercept=0, col="red", alpha=0.6)+ xlab("Theoretical Quantiles") + ylab("Sample Quantiles (Easting Residuals)") + theme(aspect.ratio=1)
+
+#model2_norm_qq, 800 x 400
+grid.arrange(qqplot_northing, qqplot_easting, ncol=2)
+```
+
+
+#-------------------------------------FULL BHM-------------------------------------------
+
+
+Model Specification:
+
+```{stan, model_full, output.var="model_full", cache=TRUE}
+data {
+  int<lower = 0> N_obs;
+  int<lower = 0> N_mis;
+  int<lower = 0> N_train;
+  int<lower = 0> N_pred_mis;
+  int<lower = 1, upper = N_obs + N_mis> ii_obs[N_obs];
+  int<lower = 1, upper = N_obs + N_mis> ii_mis[N_mis];
+  int<lower = 1, upper = N_obs + N_mis> ii_pred_mis[N_pred_mis];
+  matrix[2,N_obs] meas_obs;
+  matrix[3,N_obs+N_mis] fore;
+}
+
+transformed data {
+  int<lower = 0> N = N_obs + N_mis;
+}
+
+parameters {
+  matrix[3,2] Beta;
+  matrix[2,N_mis] meas_mis;
+  matrix[2,2] phi1;
+  matrix[2,2] phi2;
+  matrix[2,2] phi3;
+  matrix[2,2] phi4;
+  real<lower=0, upper=1> a11;
+  real<lower=0, upper=1> a22;
+  real<lower=0, upper=sqrt(1-a11^2)> b11;
+  real<lower=0, upper=sqrt(1-a22^2)> b22;
+  cov_matrix[2] C;
+  real<lower=2> nu; 
+  cov_matrix[2] H1;
+}
+
+transformed parameters {
+  vector[2] A = [a11,a22]';
+  vector[2] B = [b11,b22]';
+  matrix[2,N] xi;
+  matrix[2,N] epsilon;
+  matrix[2,N] meas;
+  cov_matrix[2] H[N];
+  matrix[2,N] std_resid;
+  meas[,ii_obs] = meas_obs;
+  meas[,ii_mis] = meas_mis;
+  H[1] = H1;
+  for (n in 2:5){
+    xi[,n-1] = meas[,n-1]-(fore[,n-1]' * Beta)';
+    epsilon[,n-1] = xi[,n-1];
+    H[n] = C + quad_form_diag(epsilon[,n-1]*epsilon[,n-1]', A) + quad_form_diag(H[n-1], B);
+  }
+  for (n in 6:N){
+    xi[,n-1] = meas[,n-1]-(fore[,n-1]' * Beta)';
+    epsilon[,n-1] = xi[,n-1] - phi1*(xi[,n-2]) - phi2*(xi[,n-3]) - phi3*(xi[,n-4]) - phi4*(xi[,n-5]);
+    H[n] = C + quad_form_diag(epsilon[,n-1]*epsilon[,n-1]', A) + quad_form_diag(H[n-1], B);
+  }
+  xi[,N] = meas[,N]-(fore[,N]' * Beta)';
+  epsilon[,N] = xi[,N] - phi1*(xi[,N-1]) - phi2*(xi[,N-2]) - phi3*(xi[,N-3]) - phi4*(xi[,N-4]);
+  for (n in 1:N){
+    std_resid[1,n] = epsilon[1,n]/sqrt(H[n,1,1]);
+    std_resid[2,n] = epsilon[2,n]/sqrt(H[n,2,2]);
+  }
+}
+
+model {
+  to_vector(Beta) - [0,1,0,0,0,1]' ~ normal(0,3);
+  to_vector(phi1) ~ std_normal();
+  to_vector(phi2) ~ std_normal();
+  to_vector(phi3) ~ std_normal();
+  to_vector(phi4) ~ std_normal();
+  a11  ~ normal(0,1) T[0, 1];
+  a22  ~ normal(0,1) T[0, 1];
+  b11  ~ normal(0,1) T[0, 1];
+  b22  ~ normal(0,1) T[0, 1];
+  H1 ~ wishart(3, diag_matrix([1,1]'));
+  for (n in 1:4){
+    meas[,n] ~ multi_student_t(nu, (fore[,n]' * Beta)', H[n]);
+  }
+  for (n in 5:N_train){
+    meas[,n] ~ multi_student_t(nu, (fore[,n]' * Beta)' + phi1*(xi[,n-1]) +
+                            phi2*(xi[,n-2]) + phi3*(xi[,n-3]) + phi4*(xi[,n-4]), 
+                            H[n]);
+  }
+  for (n in ii_pred_mis){
+    meas[,n] ~ multi_student_t(nu, (fore[,n]' * Beta)' + phi1*(xi[,n-1]) +
+                            phi2*(xi[,n-2]) + phi3*(xi[,n-3]) + phi4*(xi[,n-4]), 
+                            H[n]);
+  }
+}
+
+generated quantities {
+  matrix[2,N-N_train] forecast_pred;
+  {
+    int pred_start = N_train+1;
+    
+    for (n in pred_start:N){
+      forecast_pred[,n-N_train] = multi_student_t_rng(nu, (fore[,n]' * Beta)' +
+                              phi1*(xi[,n-1]) + phi2*(xi[,n-2]) +
+                              phi3*(xi[,n-3]) + phi4*(xi[,n-4]), 
+                              H[n]);
+    }
+  }
+}
+
+```
+
+Model Fitting: 
+
+```{r, results='hide', message=FALSE}
+ 
+ii_obs <- which(!is.na(Y[,1]))
+ii_mis <- which(is.na(Y[,1]))
+N_train <- 2000
+ii_pred_mis <- ii_mis[which(ii_mis > N_train)]
+N_obs <- length(ii_obs)
+N_mis <- length(ii_mis)
+N_pred_mis <- length(ii_pred_mis)
+meas_obs <- t(na.omit(Y))
+fore <- t(X)
+
+data.in <- list(ii_obs = ii_obs, ii_mis = ii_mis, ii_pred_mis = ii_pred_mis, N_train = N_train, N_obs = N_obs, N_mis=N_mis, N_pred_mis = N_pred_mis, meas_obs=meas_obs,fore=fore)
+
+model_fit_full <- sampling(model_full, data=data.in, chain = 3, iter=50, seed=1)
+
+#saveRDS(model_fit3_pred, file = "model_fit3_pred6hour.rds")
+#model_fit3_pred <- readRDS(file = "model_fit3_pred6hour.rds")
+
+```
+
+```{r, results='hide', message=FALSE}
+mcmc_trace(model_fit_full, pars="C[2,1]")
+```
+
+```{r}
+
+#rename the parameters so that they appear correctly in axis and plot titles. 
+color_scheme_set('mix-darkgray-blue')
+
+names(model_fit_full)[1:6] <- c('beta[n[1]]', 'beta[n[2]]','beta[n[3]]','beta[e[1]]','beta[e[2]]','beta[e[3]]')
+
+names(model_fit_full)[37:52] <- c('phi[n[1]]', 'phi[e[1]]', 'phi*minute[n[1]]', 'phi*minute[e[1]]', 
+                              'phi[n[2]]', 'phi[e[2]]', 'phi*minute[n[2]]', 'phi*minute[e[2]]',
+                              'phi[n[3]]', 'phi[e[3]]', 'phi*minute[n[3]]', 'phi*minute[e[3]]',
+                              'phi[n[4]]', 'phi[e[4]]', 'phi*minute[n[4]]', 'phi*minute[e[4]]')
+names(model_fit_full)[57:64] <- c('A["1,1"]','A["2,2"]','B["1,1"]','B["2,2"]', 'C["1,1"]','C["2,1"]', 'C["2,2"]', 'nu')
+
+#dens_all.pdf, 12 x 8 (dens_all.png, 1200 x 1000)
+mcmc_dens(model_fit_full, pars=c('beta[n[1]]', 'beta[n[2]]', 'beta[n[3]]', 'beta[e[1]]', 'beta[e[2]]', 'beta[e[3]]', 'phi[n[1]]', 'phi*minute[n[1]]', 'phi[e[1]]', 'phi*minute[e[1]]', 'phi[n[2]]', 'phi*minute[n[2]]', 'phi[e[2]]', 'phi*minute[e[2]]', 'phi[n[3]]', 'phi*minute[n[3]]', 'phi[e[3]]', 'phi*minute[e[3]]', 'phi[n[4]]', 'phi*minute[n[4]]', 'phi[e[4]]', 'phi*minute[e[4]]', 'A["1,1"]', 'A["2,2"]', 'B["1,1"]', 'B["2,2"]', 'C["1,1"]', 'C["2,1"]', 'C["2,2"]', 'nu'), 
+           facet_args = list(ncol=6, labeller = ggplot2::label_parsed)) + facet_text(size = 14) + theme(panel.spacing.x = unit(1, "lines"))
+
+```
+
+MSE: 
+
+```{r}
+ii_pred <- (N_train+1):NROW(Y)
+ii_pred_obs <- ii_obs[which(ii_obs > N_train)] - N_train
+N_pred <- length(ii_pred)
+
+Y_pred <- Y[ii_pred,]
+X_pred <- X[ii_pred,] 
+mean(((Y_pred - X_pred[,2:3])[ii_pred_obs,])^2)
+mean(((Y_pred - matrix(get_posterior_mean(model_fit_full, pars='forecast_pred')[,4], ncol=2))[ii_pred_obs,])^2)
+```
+
+CRPS: 
+
+```{r}
+
+color_scheme_set('mix-darkgray-blue')
+
+n_iter = 1000
+pp_forecasts_sort <- array(0, dim=c(3*n_iter,2,N_pred))
+
+pp_forecasts_reformat <- matrix(as.vector(as.array(model_fit_full, pars = 'forecast_pred')), nrow=3*n_iter)
+for (i in 1:N_pred){
+  pp_forecasts_sort[,1,i]<- sort(pp_forecasts_reformat[,i*2-1])
+  pp_forecasts_sort[,2,i]<- sort(pp_forecasts_reformat[,i*2])
+}
+m <- 3 * n_iter
+m_squared <- m^2
+CRPS <- array(0, dim=c(length(ii_pred_obs),2))
+for (i in ii_pred_obs){
+  for (j in 1:2){
+    sum <- 0
+    for (k in 1:m){
+      sum = sum + (pp_forecasts_sort[k,j,i]-Y_pred[i,j])*(m*ifelse(Y_pred[i,j]<pp_forecasts_sort[k,j,i],1,0)-k+0.5)
+    }
+    CRPS[which(i==ii_pred_obs),j] <- sum * 2 / m_squared
+  }
+}
+
+CRPS_det_mean <- mean(abs(Y_pred[ii_pred_obs,] - X_pred[ii_pred_obs,2:3]))
+CRPS_det_mean #mean CRPS of deterministic forecasts
+mean(CRPS) #CRPS of probabilistic forecasts
+
+
+```
+
+Probabilistic Forecasts:
+
+```{r}
+forecast_df_testing <- as_tibble(list(date = wind_comb$time[ii_pred], 
+                         meas_northing = Y_pred[,1],
+                         det_northing_fore = X_pred[,2],
+                         pp_northing_5 = pp_forecasts_sort[ceiling(m*.05), 1,],
+                         pp_northing_15 = pp_forecasts_sort[ceiling(m*.15), 1,],
+                         pp_northing_25 = pp_forecasts_sort[ceiling(m*.25), 1,],
+                         pp_northing_35 = pp_forecasts_sort[ceiling(m*.35), 1,],
+                         pp_northing_45 = pp_forecasts_sort[ceiling(m*.45), 1,],
+                         pp_northing_50 = pp_forecasts_sort[m %/% 2, 1,],
+                         pp_northing_55 = pp_forecasts_sort[ceiling(m*.55), 1,],
+                         pp_northing_65 = pp_forecasts_sort[ceiling(m*.65), 1,],
+                         pp_northing_75 = pp_forecasts_sort[ceiling(m*.75), 1,],
+                         pp_northing_85 = pp_forecasts_sort[ceiling(m*.85), 1,],
+                         pp_northing_95 = pp_forecasts_sort[ceiling(m*.95), 1,],
+                         meas_easting = Y_pred[,2],
+                         det_easting_fore = X_pred[,3],
+                         pp_easting_5 = pp_forecasts_sort[ceiling(m*.05), 2,],
+                         pp_easting_15 = pp_forecasts_sort[ceiling(m*.15), 2,],
+                         pp_easting_25 = pp_forecasts_sort[ceiling(m*.25), 2,],
+                         pp_easting_35 = pp_forecasts_sort[ceiling(m*.35), 2,],
+                         pp_easting_45 = pp_forecasts_sort[ceiling(m*.45), 2,],
+                         pp_easting_50 = pp_forecasts_sort[m %/% 2, 2,],
+                         pp_easting_55 = pp_forecasts_sort[ceiling(m*.55), 2,],
+                         pp_easting_65 = pp_forecasts_sort[ceiling(m*.65), 2,],
+                         pp_easting_75 = pp_forecasts_sort[ceiling(m*.75), 2,],
+                         pp_easting_85 = pp_forecasts_sort[ceiling(m*.85), 2,],
+                         pp_easting_95 = pp_forecasts_sort[ceiling(m*.95), 2,])) %>% subset(date > "2019-05-20")
+
+lims <- as.POSIXct(strptime(c("2019-05-20 6:00", "2019-06-21 18:00"), 
+                   format = "%Y-%m-%d %H:%M"))   
+
+fore_northing <- ggplot(forecast_df_testing, aes(x=date)) + 
+  geom_line(aes(y = pp_northing_50, color="Probabilistic Forecast"),size=0.25) +
+  geom_ribbon(aes(ymin=pp_northing_5, ymax=pp_northing_95), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_northing_15, ymax=pp_northing_85), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_northing_25, ymax=pp_northing_75), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_northing_35, ymax=pp_northing_65), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_northing_45, ymax=pp_northing_55), fill="red", alpha = 0.15) +
+  geom_line(aes(y = meas_northing, color = "Measurement")) + 
+  scale_color_manual(name = "", values = c("Measurement" = "black", "Probabilistic Forecast" = "red")) + ylab("Northings") + theme(legend.position = "none", axis.title.x=element_blank())+scale_x_datetime(limits = lims, expand = c(0, 0)) 
+
+
+fore_easting <- ggplot(forecast_df_testing, aes(x=date)) + 
+  geom_line(aes(y = pp_easting_50, color="Probabilistic Forecast"),size=0.25) +
+  geom_ribbon(aes(ymin=pp_easting_5, ymax=pp_easting_95), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_easting_15, ymax=pp_easting_85), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_easting_25, ymax=pp_easting_75), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_easting_35, ymax=pp_easting_65), fill="red", alpha = 0.15) +
+  geom_ribbon(aes(ymin=pp_easting_45, ymax=pp_easting_55), fill="red", alpha = 0.15) +
+  geom_line(aes(y = meas_easting, color = "Measurement")) + 
+  scale_color_manual(name = "", values = c("Measurement" = "black", "Probabilistic Forecast" = "red")) + ylab("Eastings") + xlab("Date") + theme(legend.position = "bottom")+scale_x_datetime(limits = lims, expand = c(0, 0)) 
+                                                                                  
+
+#prob_fores.pdf, 9 x 5
+grid.arrange(fore_northing, fore_easting, ncol=1, heights=c(1.5, 2.05))
+```
+
+Residuals: 
+
+```{r}
+
+std_resid_north <- get_posterior_mean(model_fit_full, pars='std_resid')[1:(N_obs+N_mis),4]
+std_resid_east <- get_posterior_mean(model_fit_full, pars='std_resid')[(N_obs+N_mis+1):(2*(N_obs+N_mis)),4]
+
+resid_df <- as_tibble(list(northing_residuals = std_resid_north, easting_residuals=std_resid_east, date = wind_comb$time))
+
+#acf_pacf_model3, 1200 x 300 // acf_pacf_model3_6hour
+northing_resid_acf <- ggAcf(resid_df$northing_residuals) + ggtitle("") + ylab("ACF of Northing Residuals") + ylim(-.085,0.26)
+northing_resid_pacf <- ggPacf(resid_df$northing_residuals) + ggtitle("") + ylab("PACF of Northing Residuals") + ylim(-.085,0.26)
+easting_resid_acf <- ggAcf(resid_df$easting_residuals) + ggtitle("") + ylab("ACF of Easting Residuals") + ylim(-.085,0.26)
+easting_resid_pacf <- ggPacf(resid_df$easting_residuals) + ggtitle("") + ylab("PACF of Easting Residuals")+ ylim(-.085,0.26)
+grid.arrange(northing_resid_acf, northing_resid_pacf, easting_resid_acf, easting_resid_pacf, ncol=4)
+
+#acf_pacf_sqd_model3, 1200 x 300 // acf_pacf_sqd_model3_6hour
+northing_resid_sqd_acf <- ggAcf(resid_df$northing_residuals^2) + ggtitle("")  + ylab("ACF of Squared Northing Residuals") + ylim(-.075,0.4)
+northing_resid_sqd_pacf <- ggPacf(resid_df$northing_residuals^2) + ggtitle("") + ylab("PACF of Squared Northing Residuals")  + ylim(-.075,0.4)
+easting_resid_sqd_acf <- ggAcf(resid_df$easting_residuals^2) + ggtitle("") + ylab("ACF of Squared Easting Residuals") + ylim(-.075,0.4)
+easting_resid_sqd_pacf <- ggPacf(resid_df$easting_residuals^2) + ggtitle("") + ylab("PACF of Squared Easting Residuals") + ylim(-.075,0.4)
+grid.arrange(northing_resid_sqd_acf, northing_resid_sqd_pacf, easting_resid_sqd_acf, easting_resid_sqd_pacf, ncol=4)
+
+#qqplot_model3, 800 x 400 // qqplot_model3_6hour, 800 x 400
+qqplot_northing <- ggplot(resid_df, aes(sample = northing_residuals)) + stat_qq(distribution=stats::qt, dparams=list(get_posterior_mean(model_fit_full, pars='nu')[4])) + geom_abline(slope=1, intercept=0, col="red")+ xlab("Theoretical Quantiles") + ylab("Sample Quantiles (Northing Residuals)") + theme(aspect.ratio=1)
+qqplot_easting <- ggplot(resid_df, aes(sample = easting_residuals)) + stat_qq(distribution=stats::qt, dparams=list(get_posterior_mean(model_fit_full, pars='nu')[4])) + geom_abline(slope=1, intercept=0, col="red")+ xlab("Theoretical Quantiles") + ylab("Sample Quantiles (Easting Residuals)") + theme(aspect.ratio=1)
+grid.arrange(qqplot_northing, qqplot_easting, ncol=2)
+
+```
